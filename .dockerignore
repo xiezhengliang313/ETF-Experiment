@@ -1,0 +1,13 @@
+# 不进镜像的东西（越小构建越快；.env 绝不能打进镜像）
+.git
+.env
+docs
+.logs
+node_modules
+frontend/node_modules
+frontend/dist
+__pycache__
+*.pyc
+*.dump
+*.sql.gz
+*.log

@@ -1,0 +1,16 @@
+# 后端依赖（版本 = 本机已经跑通的版本，别随意升级）
+fastapi==0.141.1
+uvicorn==0.54.0
+requests==2.34.2
+
+# 数据库驱动（[binary] 自带 libpq，slim 镜像不用再装 postgresql 开发包）
+psycopg[binary]==3.3.6
+
+# 计算三件套
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.1
+
+# akshare 只在「同步行情」拉交易日历时用（framework/etf_sync.py），包很大。
+# 方案A（Render 免费 512MB）必须注掉，否则可能 OOM：数据在本地同步好再导上去。
+# akshare==1.18.94

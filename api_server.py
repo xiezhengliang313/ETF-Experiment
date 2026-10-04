@@ -17,9 +17,11 @@
 """
 
 import asyncio
+import base64
 import datetime as dt
 import decimal
 import os
+import secrets
 import traceback
 import uuid
 from contextlib import contextmanager, redirect_stdout
@@ -30,8 +32,9 @@ import psycopg
 import psycopg.errors
 from psycopg.rows import dict_row
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from framework.etf_sync import EtfSync
 from framework.etf_quote import EtfQuote
@@ -49,6 +52,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ================================================================ 访问密码（只在上线部署时生效）
+# 设了环境变量 APP_PASSWORD 才拦：浏览器第一次打开会弹账号密码框，之后所有请求自动带上。
+# 本地不设 = 完全不启用，开发照旧（所以这段代码不影响本机使用）。
+APP_USER = os.environ.get("APP_USER", "etf")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
+
+@app.middleware("http")
+async def _basic_auth(request: Request, call_next):
+    if APP_PASSWORD:
+        raw = request.headers.get("authorization", "")
+        ok = False
+        if raw.startswith("Basic "):
+            try:
+                user, _, pwd = base64.b64decode(raw[6:]).decode("utf-8").partition(":")
+                ok = (secrets.compare_digest(user, APP_USER)
+                      and secrets.compare_digest(pwd, APP_PASSWORD))
+            except Exception:
+                ok = False
+        if not ok:
+            return Response("需要登录", status_code=401,
+                            headers={"WWW-Authenticate": 'Basic realm="ETF 系统"'})
+    return await call_next(request)
 
 METHODS = ("max_sharpe", "min_variance", "trend")
 FAR_FUTURE = dt.date(9999, 12, 31)  # 分段 end_date = 跑到账户结束
@@ -1010,6 +1037,23 @@ def task(tid: str):
     if t is None:
         raise HTTPException(404, "任务不存在")
     return t
+
+
+# ================================================================ 前端静态文件（线上部署用）
+# 本地开发走 Vite(3000)；线上把 npm run build 的产物交给后端托管，只暴露一个端口。
+# 必须放在所有 /api 路由之后 —— 路由按注册顺序匹配，这段的兜底会吃掉后面注册的东西。
+_DIST = Path(__file__).with_name("frontend") / "dist"
+if _DIST.is_dir():
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa(full_path: str):
+        """/quote、/detail/backtest/3 这类前端路由刷新时返回 index.html；静态文件按名返回。"""
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "接口不存在")
+        f = (_DIST / full_path).resolve()
+        if full_path and f.is_file() and str(f).startswith(str(_DIST.resolve())):
+            return FileResponse(f)
+        return FileResponse(_DIST / "index.html")
 
 
 if __name__ == "__main__":
