@@ -1,5 +1,5 @@
 -- =========================================================================
--- ETF 策略框架 —— 一键建库脚本（18 张表）
+-- ETF 策略框架 —— 一键建库脚本（22 张表）
 -- 用法：psql -f schema.sql  （或由项目内脚本按 ';' 拆分执行）
 -- 说明：幂等可重复执行（只 CREATE IF NOT EXISTS + 注释，不动已有数据）。
 --       旧版（run_id 型）bt_* 已在首次迁移时清理完毕；若确需「彻底重建
@@ -41,6 +41,72 @@ CREATE TABLE IF NOT EXISTS etf_bars_hfq (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (code, trade_date)
 );
+
+-- =========================================================================
+-- 〇之二、ETF 实时行情快照（etf_quote.py 写入；只做展示/盯盘，不参与回测与模拟）
+--   数据源：腾讯 https://qt.gtimg.cn/q=sh510300,sz159915&fmt=json
+--           —— 返回 88 个「按下标排列」的字段、GBK 编码，接口本身不给字段名，
+--              所以下标 -> 含义的对照表写在 etf_quote.py 里（并注明哪些已核对）。
+--   主键是 (code, trade_date, quote_time)：同一个行情时间重复抓取 = 覆盖，
+--   盘中不同时间点各抓一次就各留一行（天然就是分时留痕）。
+--   trade_date 取自接口返回的行情时间（[30]），不是 date.today()，
+--   这样周末/节假日重跑只会落到上一个交易日，不会凭空多出一行假数据。
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS etf_quote (
+    code            TEXT NOT NULL,              -- 带 sh/sz 前缀
+    name            TEXT,                       -- [1]  名称
+    trade_date      DATE NOT NULL,              -- 行情所属交易日（取自 [30]）
+    quote_time      TIMESTAMP NOT NULL,         -- [30] 行情时间，20260930161443（主键的一部分）
+    -- 核心行情
+    last            NUMERIC(12,4),              -- [3]  最新价
+    prev_close      NUMERIC(12,4),              -- [4]  昨收
+    open            NUMERIC(12,4),              -- [5]  今开
+    high            NUMERIC(12,4),              -- [33] 最高
+    low             NUMERIC(12,4),              -- [34] 最低
+    change          NUMERIC(12,4),              -- [31] 涨跌
+    change_pct      NUMERIC(10,4),              -- [32] 涨跌幅 %
+    amplitude_pct   NUMERIC(10,4),              -- [43] 振幅 %
+    volume          BIGINT,                     -- [6]  成交量（手，1 手 = 100 份）
+    amount_wan      NUMERIC(20,4),              -- [57] 成交额（万元，4 位小数；[37] 是同一数的整万版）
+    turnover_pct    NUMERIC(10,4),              -- [38] 换手率 %
+    avg_price       NUMERIC(12,4),              -- [51] 均价
+    volume_ratio    NUMERIC(10,4),              -- [49] 量比
+    -- 盘口五档
+    bid1_px  NUMERIC(12,4), bid1_qty  BIGINT,   -- [9]  / [10]  买一
+    bid2_px  NUMERIC(12,4), bid2_qty  BIGINT,   -- [11] / [12]  买二
+    bid3_px  NUMERIC(12,4), bid3_qty  BIGINT,   -- [13] / [14]  买三
+    bid4_px  NUMERIC(12,4), bid4_qty  BIGINT,   -- [15] / [16]  买四
+    bid5_px  NUMERIC(12,4), bid5_qty  BIGINT,   -- [17] / [18]  买五
+    ask1_px  NUMERIC(12,4), ask1_qty  BIGINT,   -- [19] / [20]  卖一
+    ask2_px  NUMERIC(12,4), ask2_qty  BIGINT,   -- [21] / [22]  卖二
+    ask3_px  NUMERIC(12,4), ask3_qty  BIGINT,   -- [23] / [24]  卖三
+    ask4_px  NUMERIC(12,4), ask4_qty  BIGINT,   -- [25] / [26]  卖四
+    ask5_px  NUMERIC(12,4), ask5_qty  BIGINT,   -- [27] / [28]  卖五
+    outer_vol       BIGINT,                     -- [7]  外盘（手，主动买）
+    inner_vol       BIGINT,                     -- [8]  内盘（手，主动卖）
+    order_diff      BIGINT,                     -- [50] 委差（手）
+    -- 净值与折溢价（ETF 专用；接口里 [77]/[78] 这一套）
+    nav             NUMERIC(12,4),              -- [78] 净值 / IOPV
+    premium         NUMERIC(10,4),              -- [77] 折溢价率 %（= 最新价 / [78] − 1）
+    -- 区间涨跌幅 %
+    ret_ytd         NUMERIC(10,4),              -- [62] 年初至今
+    ret_5d          NUMERIC(10,4),              -- [63] 近 5 日
+    ret_10d         NUMERIC(10,4),              -- [69] 近 10 日
+    ret_20d         NUMERIC(10,4),              -- [70] 近 20 日
+    ret_60d         NUMERIC(10,4),              -- [71] 近 60 日
+    high_52w        NUMERIC(12,4),              -- [67] 52 周最高（近 250 交易日）
+    low_52w         NUMERIC(12,4),              -- [68] 52 周最低
+    -- 市值 / 股本 / 涨跌停
+    market_cap      NUMERIC(20,4),              -- [45] 总市值（亿）
+    float_cap       NUMERIC(20,4),              -- [44] 流通市值（亿）
+    total_shares    BIGINT,                     -- [72] 总股本（股）
+    float_shares    BIGINT,                     -- [73] 流通股本（股）
+    limit_up        NUMERIC(12,4),              -- [47] 涨停价（指数为 -1）
+    limit_down      NUMERIC(12,4),              -- [48] 跌停价
+    PRIMARY KEY (code, trade_date, quote_time)  -- 同一行情时间覆盖；不同时间点各留一行
+);
+CREATE INDEX IF NOT EXISTS idx_etf_quote_date ON etf_quote (trade_date DESC, quote_time DESC);
+COMMENT ON TABLE etf_quote IS 'ETF 当日实时行情快照（腾讯 qt.gtimg.cn，etf_quote.py 写入，按行情时间留痕）';
 
 -- =========================================================================
 -- 一、回测参数表（= 策略表）

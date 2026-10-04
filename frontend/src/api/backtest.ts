@@ -1,6 +1,6 @@
 import { api } from './client'
 import type {
-  CalendarPoint, CurvePoint, DrawdownPoint, Holding, Metric, ReturnPoint, Strategy, Trade,
+  CalendarPoint, Contrib, CurvePoint, DrawdownPoint, Holding, Metric, ReturnPoint, Strategy, Trade,
 } from '../types'
 
 export interface StrategyInput {
@@ -74,4 +74,9 @@ export async function getMetrics(id: number): Promise<Partial<Metric>> {
 
 export async function getCalendar(id: number): Promise<CalendarPoint[]> {
   return (await api.get<CalendarPoint[]>(`/backtest/strategies/${id}/calendar`)).data
+}
+
+// 收益贡献归因：每只 ETF 给这个策略贡献了多少钱、占比多少
+export async function getContrib(id: number): Promise<Contrib> {
+  return (await api.get<Contrib>(`/backtest/strategies/${id}/contrib`)).data
 }

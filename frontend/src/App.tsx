@@ -4,7 +4,11 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 export default function App() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
-  const selected = pathname.startsWith('/settings') ? '/settings' : '/'
+  const selected = pathname.startsWith('/settings')
+    ? '/settings'
+    : pathname.startsWith('/quote')
+      ? '/quote'
+      : '/'
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -17,7 +21,8 @@ export default function App() {
           selectedKeys={[selected]}
           onClick={(e) => navigate(e.key)}
           items={[
-            { key: '/', label: '总览' },
+            { key: '/quote', label: '实时行情' },
+            { key: '/', label: '策略总览' },
             { key: '/settings', label: '系统设置' },
           ]}
         />

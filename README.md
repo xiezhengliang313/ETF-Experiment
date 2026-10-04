@@ -4,7 +4,7 @@
 
 - 后端：FastAPI + PostgreSQL（`api_server.py` + `framework/`）
 - 前端：React 18 + Ant Design + ECharts + Vite（`frontend/`）
-- 页面：总览（策略/账户排行榜）、明细（指标 + 走势 + 持仓 + 交易）、系统设置（数据更新 / 回测 / 寻优 / 模拟）
+- 页面（侧边栏顺序）：实时行情（ETF 当日快照）、策略总览（策略/账户排行榜）、明细（指标 + 走势 + 持仓 + 交易 + 标的贡献比）、系统设置（数据更新 / 实时行情 / 回测 / 寻优 / 模拟）
 
 ---
 
@@ -110,10 +110,11 @@ Invoke-WebRequest http://localhost:3000
 ETF-Experiment/
 ├─ .env                      # 数据库连接配置（不要提交）
 ├─ api_server.py             # FastAPI 后端，/api/* 接口 + 任务调度
-├─ schema.sql                # 一键建库脚本（幂等，18 张表）
+├─ schema.sql                # 一键建库脚本（幂等，22 张表）
 ├─ docs/                     # 系统设计方案 / FastAPI方案 / React方案
 ├─ framework/                # 业务框架（python -m framework.xxx 运行）
 │  ├─ etf_sync.py            #   行情同步
+│  ├─ etf_quote.py           #   实时行情抓取（腾讯 qt.gtimg.cn → etf_quote）
 │  ├─ gen_dividends.py       #   分红生成
 │  ├─ backtest_framework.py  #   回测
 │  ├─ optimize_framework.py  #   参数寻优

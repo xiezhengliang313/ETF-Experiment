@@ -25,3 +25,17 @@ body {
   font-size: 12px;
   margin: 0;
 }
+
+/* 实时行情表：紧凑行高（12px 字 + 3px 内边距 ≈ 25px/行），一屏放下 15 只以上
+   （配合 Table 的 scroll.y = 450px） */
+.quote-table .ant-table-thead > tr > th,
+.quote-table .ant-table-tbody > tr > td {
+  padding: 3px 6px !important;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.quote-table .ant-table-thead > tr > th {
+  background: #fafafa;
+  font-weight: 600;
+}

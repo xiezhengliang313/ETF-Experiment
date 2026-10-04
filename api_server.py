@@ -34,6 +34,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from framework.etf_sync import EtfSync
+from framework.etf_quote import EtfQuote
 from framework.gen_dividends import DividendBuilder
 from framework.backtest_framework import BacktestFramework, sync_strategy_name
 from framework.optimize_framework import OptimizeFramework
@@ -264,7 +265,7 @@ def health():
             tables = {}
             for t in ("bt_params", "sim_account", "sim_params", "opt_results", "opt_walk", "opt_folds",
                       "opt_oos_nav", "bt_nav", "sim_nav", "etf_bars_raw", "etf_dividends",
-                      "trade_calendar"):
+                      "etf_quote", "trade_calendar"):
                 tables[t] = _one(conn, f"SELECT count(*) AS c FROM {t}")["c"]
         return {"status": "ok", "db": "connected",
                 "latest_trade_date": latest, "tables": tables,
@@ -302,6 +303,51 @@ def dividends(code: str | None = None):
 @app.post("/api/dividends/generate", status_code=202)
 async def dividends_generate():
     tid = await submit("分红生成", lambda: DividendBuilder().run())
+    return {"task_id": tid}
+
+
+# ================================================================ 5.2.1 ETF 实时行情
+# etf_quote 表由 framework/etf_quote.py 抓腾讯 qt.gtimg.cn 写入；这里只读 + 触发抓取。
+# 字段下标 -> 含义的对照表在 etf_quote.py 的文档字符串里（哪些已核对都标了）。
+_QUOTE_COLS = (
+    "code, name, trade_date, quote_time, "
+    "last, prev_close, open, high, low, change, change_pct, amplitude_pct, "
+    "volume, amount_wan, turnover_pct, avg_price, volume_ratio, "
+    "bid1_px, bid1_qty, bid2_px, bid2_qty, bid3_px, bid3_qty, bid4_px, bid4_qty, bid5_px, bid5_qty, "
+    "ask1_px, ask1_qty, ask2_px, ask2_qty, ask3_px, ask3_qty, ask4_px, ask4_qty, ask5_px, ask5_qty, "
+    "outer_vol, inner_vol, order_diff, "
+    "nav, premium, "
+    "ret_ytd, ret_5d, ret_10d, ret_20d, ret_60d, high_52w, low_52w, "
+    "market_cap, float_cap, total_shares, float_shares, limit_up, limit_down"
+)
+
+
+@app.get("/api/quote")
+def quote_list(date: str | None = None, code: str | None = None):
+    """ETF 实时行情快照：每个标的取最新那条（主键含 quote_time，一天可能存了多批）。
+
+    注意不能只取全局 max(quote_time) —— 同一次抓取里各标的的行情时间并不相同
+    （实测 510300 是 16:14:43、159915 是 16:14:21），那样会漏掉时间早的标的。
+    """
+    with db() as conn:
+        row = _one(conn, "SELECT max(trade_date) AS d FROM etf_quote")
+        d = date or (row or {}).get("d")
+        if not d:
+            return {"trade_date": None, "quote_time": None, "count": 0, "rows": []}
+        sql = (f"SELECT DISTINCT ON (code) {_QUOTE_COLS} FROM etf_quote "
+               "WHERE trade_date = %s" + (" AND code = %s" if code else "") +
+               " ORDER BY code, quote_time DESC")
+        rows = _query(conn, sql, (d, code) if code else (d,))
+    return {"trade_date": d,
+            "quote_time": max((r["quote_time"] for r in rows), default=None),
+            "count": len(rows), "rows": rows}
+
+
+@app.post("/api/quote/run", status_code=202)
+async def quote_run(codes: str | None = None):
+    """抓一次实时行情 -> task_id。codes（逗号分隔）可只抓指定几只。"""
+    want = [c.strip() for c in codes.split(",") if c.strip()] if codes else None
+    tid = await submit("实时行情抓取", lambda: EtfQuote().run(codes=want))
     return {"task_id": tid}
 
 
@@ -503,6 +549,121 @@ def bt_calendar(sid: int):
     for r in rows:
         r["is_future"] = latest is not None and r["rebal_date"] > latest
     return rows
+
+
+# ==================================================== 5.3.1 收益贡献归因（按标的）
+# 贡献（元）= Σ卖出金额 − Σ买入金额 − Σ手续费 + 期末股数 × 最后一天收盘价
+#          = 已实现盈亏（平均成本法）+ 还持着那部分的浮动盈亏
+# 各标的贡献之和恒等于「净值增益」（现金部分贡献为 0），所以没有配平项、不会对不上。
+#   回测：金额与价格都是后复权口径，分红已内含在价格里，不用另加；
+#   模拟：真实价成交、分红单独进现金，必须把持有期的分红加回贡献，否则对不上净值。
+_BT_CONTRIB_SQL = """
+WITH tr AS (
+  SELECT code, max(name) AS name, count(*) AS trades,
+         min(trade_date) AS first_date, max(trade_date) AS last_date,
+         sum(CASE WHEN side = 'BUY'  THEN amount ELSE 0 END) AS buy_amt,
+         sum(CASE WHEN side = 'BUY'  THEN fee    ELSE 0 END) AS buy_fee,
+         sum(CASE WHEN side = 'BUY'  THEN qty    ELSE 0 END) AS buy_qty,
+         sum(CASE WHEN side = 'SELL' THEN amount ELSE 0 END) AS sell_amt,
+         sum(CASE WHEN side = 'SELL' THEN fee    ELSE 0 END) AS sell_fee,
+         sum(CASE WHEN side = 'SELL' THEN qty    ELSE 0 END) AS sell_qty,
+         sum(CASE WHEN side = 'BUY'  THEN qty ELSE -qty END) AS qty_end
+  FROM bt_trades WHERE strategy_id = %s GROUP BY code
+), px AS (
+  SELECT DISTINCT ON (code) code, close FROM etf_bars_hfq ORDER BY code, trade_date DESC
+), d AS (
+  SELECT tr.*, px.close AS last_close,
+         (tr.buy_amt + tr.buy_fee) / NULLIF(tr.buy_qty, 0) AS avg_cost
+  FROM tr JOIN px ON px.code = tr.code
+)
+SELECT d.code, d.name, d.trades, d.first_date, d.last_date, d.qty_end, d.avg_cost, d.last_close,
+       d.buy_amt AS bought, d.sell_amt AS sold, (d.buy_fee + d.sell_fee) AS fee,
+       0::numeric AS dividend,
+       d.sell_amt - d.sell_fee - d.avg_cost * d.sell_qty AS realized,
+       d.qty_end * d.last_close - d.avg_cost * d.qty_end AS unrealized,
+       d.sell_amt - d.sell_fee - d.avg_cost * d.sell_qty
+         + d.qty_end * d.last_close - d.avg_cost * d.qty_end AS contrib
+FROM d
+ORDER BY contrib DESC
+"""
+
+_SIM_CONTRIB_SQL = """
+WITH tr AS (
+  SELECT code, max(name) AS name, count(*) AS trades,
+         min(trade_date) AS first_date, max(trade_date) AS last_date,
+         sum(CASE WHEN side = 'BUY'  THEN amount ELSE 0 END) AS buy_amt,
+         sum(CASE WHEN side = 'BUY'  THEN fee    ELSE 0 END) AS buy_fee,
+         sum(CASE WHEN side = 'BUY'  THEN qty    ELSE 0 END) AS buy_qty,
+         sum(CASE WHEN side = 'SELL' THEN amount ELSE 0 END) AS sell_amt,
+         sum(CASE WHEN side = 'SELL' THEN fee    ELSE 0 END) AS sell_fee,
+         sum(CASE WHEN side = 'SELL' THEN qty    ELSE 0 END) AS sell_qty,
+         sum(CASE WHEN side = 'BUY'  THEN qty ELSE -qty END) AS qty_end
+  FROM sim_trades WHERE account_id = %s GROUP BY code
+), px AS (
+  SELECT DISTINCT ON (code) code, close FROM etf_bars_raw ORDER BY code, trade_date DESC
+), dvd AS (
+  -- 除息日前持有的份额才享有分红（当天买入不享有），与模拟引擎「先分红后调仓」口径一致
+  SELECT dd.code, sum(dd.div_per_share * COALESCE((
+           SELECT sum(CASE WHEN x.side = 'BUY' THEN x.qty ELSE -x.qty END)
+           FROM sim_trades x
+           WHERE x.account_id = %s AND x.code = dd.code AND x.trade_date < dd.ex_date
+         ), 0)) AS dividend
+  FROM etf_dividends dd
+  WHERE dd.code IN (SELECT code FROM tr)
+  GROUP BY dd.code
+), d AS (
+  SELECT tr.*, px.close AS last_close, COALESCE(dvd.dividend, 0) AS dividend,
+         (tr.buy_amt + tr.buy_fee) / NULLIF(tr.buy_qty, 0) AS avg_cost
+  FROM tr JOIN px ON px.code = tr.code
+  LEFT JOIN dvd ON dvd.code = tr.code
+)
+SELECT d.code, d.name, d.trades, d.first_date, d.last_date, d.qty_end, d.avg_cost, d.last_close,
+       d.buy_amt AS bought, d.sell_amt AS sold, (d.buy_fee + d.sell_fee) AS fee, d.dividend,
+       d.sell_amt - d.sell_fee - d.avg_cost * d.sell_qty + d.dividend AS realized,
+       d.qty_end * d.last_close - d.avg_cost * d.qty_end AS unrealized,
+       d.sell_amt - d.sell_fee - d.avg_cost * d.sell_qty
+         + d.qty_end * d.last_close - d.avg_cost * d.qty_end + d.dividend AS contrib
+FROM d
+ORDER BY contrib DESC
+"""
+
+
+def _contrib_body(kind, ident, meta, rows, nav_gain):
+    """给每只标的补上「收益占比」，并把合计摆出来（合计应等于净值增益，页面直接用它对账）。"""
+    total = sum((r["contrib"] or 0.0) for r in rows)
+    for r in rows:
+        r["share_pct"] = (r["contrib"] / total * 100.0) if total else None
+    return {
+        "kind": kind,
+        "id": ident,
+        **meta,
+        "rows": rows,
+        "total_pnl": total,
+        "total_fee": sum((r["fee"] or 0.0) for r in rows),
+        "nav_gain": nav_gain,
+    }
+
+
+@app.get("/api/backtest/strategies/{sid}/contrib")
+def bt_contrib(sid: int):
+    """策略收益按 ETF 标的拆解：贡献金额、收益占比、已实现/浮动、平均成本、期末持股。"""
+    with db() as conn:
+        p = _one(conn, "SELECT strategy_name FROM bt_params WHERE strategy_id = %s", (sid,))
+        if p is None:
+            raise HTTPException(404, "策略不存在")
+        rows = _query(conn, _BT_CONTRIB_SQL, (sid,))
+        nav = _query(conn, "SELECT trade_date, nav FROM bt_nav WHERE strategy_id = %s ORDER BY trade_date", (sid,))
+    if not nav:
+        raise HTTPException(404, "该策略尚无回测结果")
+    cash0 = float(BacktestFramework.CASH0)
+    # 注意：净值序列的首日是「第一天建完仓之后」的值（≈0.999，扣了手续费与滑点），
+    # 所以增益要减初始基数 1.0，而不是减首日净值，否则会多算那 0.1% 的建仓成本。
+    return _contrib_body("backtest", sid, {
+        "name": p["strategy_name"],
+        "start_date": nav[0]["trade_date"],
+        "end_date": nav[-1]["trade_date"],
+        "init_cash": cash0,
+    }, rows, (nav[-1]["nav"] - 1.0) * cash0)
 
 
 # ================================================================ 5.4 寻优
@@ -815,6 +976,26 @@ def sim_calendar(aid: int):
     for r in rows:
         r["is_future"] = latest is not None and r["rebal_date"] > latest
     return rows
+
+
+@app.get("/api/sim/accounts/{aid}/contrib")
+def sim_contrib(aid: int):
+    """账户收益按 ETF 标的拆解（真实价口径：分红计入贡献，期末持仓按真实收盘价估值）。"""
+    with db() as conn:
+        acc = _one(conn, "SELECT account_name, init_cash FROM sim_account WHERE account_id = %s", (aid,))
+        if acc is None:
+            raise HTTPException(404, "账户不存在")
+        rows = _query(conn, _SIM_CONTRIB_SQL, (aid, aid))
+        nav = _query(conn, "SELECT trade_date, nav FROM sim_nav WHERE account_id = %s ORDER BY trade_date", (aid,))
+    if not nav:
+        raise HTTPException(404, "该账户尚无模拟结果")
+    init = float(acc["init_cash"] or 0.0)
+    return _contrib_body("sim", aid, {
+        "name": acc["account_name"],
+        "start_date": nav[0]["trade_date"],
+        "end_date": nav[-1]["trade_date"],
+        "init_cash": init,
+    }, rows, (nav[-1]["nav"] - 1.0) * init)   # 同回测：减初始基数 1.0，不是减首日净值
 
 
 # ================================================================ 5.6 任务

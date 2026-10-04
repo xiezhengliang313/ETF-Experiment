@@ -3,13 +3,14 @@ import {
   Alert, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Tabs,
 } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate } from 'react-router-dom'
 import dayjs, { type Dayjs } from 'dayjs'
 import type { TableColumnsType } from 'antd'
 import { OosCurve } from '../components/OosCurve'
 import { ParamsForm, type ParamsValues } from '../components/ParamsForm'
 import { TaskNotice } from '../components/TaskNotice'
 import { useTask } from '../hooks/useTask'
-import { generateDividends, getCodes, syncMarket } from '../api/market'
+import { generateDividends, getCodes, getQuote, runQuote, syncMarket } from '../api/market'
 import { createStrategy, deleteStrategy, listStrategies, patchStrategy } from '../api/backtest'
 import { getWalkFolds, getWalkOos, getWinners, runOptimize } from '../api/optimize'
 import {
@@ -31,6 +32,9 @@ export default function Settings() {
     loading: running && task?.key === key,
     disabled: running && task?.key !== key,
   })
+  const navigate = useNavigate()
+  // 实时行情：这里只给「抓一次 + 概览」，全部字段在「实时行情」页面看
+  const quote = useQuery({ queryKey: ['quote'], queryFn: () => getQuote() })
   const [segModal, setSegModal] = useState<{ accountId: number; accountName: string } | null>(null)
   // 管理分段：就地改结束日（提前结束）/ 启停
   const [segListModal, setSegListModal] = useState<{ accountId: number; accountName: string } | null>(null)
@@ -278,6 +282,30 @@ export default function Settings() {
                   <Button {...busy('div')} onClick={() => startTask('div', generateDividends)}>生成分红</Button>
                 </Space>
                 <div style={{ color: '#999' }}>建议顺序：先同步行情，再生成分红，然后 回测刷新 / 寻优刷新 / 模拟刷新。</div>
+              </Space>
+            ),
+          },
+          {
+            key: 'quote',
+            label: '实时行情',
+            children: (
+              <Space direction="vertical" size="middle">
+                <Space>
+                  <Button type="primary" {...busy('quote')} onClick={() => startTask('quote', runQuote)}>
+                    抓取实时行情
+                  </Button>
+                  <span style={{ color: '#999' }}>
+                    腾讯 qt.gtimg.cn（GBK），标的取 etf_bars_raw 全部；主键含行情时间，盘中重复抓会各留一行
+                  </span>
+                </Space>
+                <div style={{ color: '#595959' }}>
+                  {quote.data?.trade_date
+                    ? `库里最新快照：交易日 ${quote.data.trade_date} · ${quote.data.count} 只 · 最新行情时间 ${String(quote.data.quote_time ?? '—').replace('T', ' ').slice(0, 19)}`
+                    : '库里还没有行情快照，点上面按钮抓一次'}
+                </div>
+                <Button type="link" style={{ padding: 0 }} onClick={() => navigate('/quote')}>
+                  去「实时行情」页面看全部字段（含五档盘口）→
+                </Button>
               </Space>
             ),
           },

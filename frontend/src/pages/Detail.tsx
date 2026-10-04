@@ -6,11 +6,13 @@ import { MetricsCard } from '../components/MetricsCard'
 import { NavChart } from '../components/NavChart'
 import { HoldingStack } from '../components/HoldingStack'
 import { ReturnHistogram } from '../components/ReturnHistogram'
+import { ContribBar } from '../components/ContribBar'
 import {
-  getCalendar, getCurve, getDrawdown, getHoldings, getMetrics, getReturns, getTrades, listStrategies,
+  getCalendar, getContrib, getCurve, getDrawdown, getHoldings, getMetrics, getReturns, getTrades,
+  listStrategies,
 } from '../api/backtest'
 import {
-  getAccountCalendar, getAccountCurve, getAccountDrawdown, getAccountHoldings,
+  getAccountCalendar, getAccountContrib, getAccountCurve, getAccountDrawdown, getAccountHoldings,
   getAccountReturns, getAccountTrades, listAccounts, listSegments,
 } from '../api/simulate'
 import type { Holding, Metric, Trade } from '../types'
@@ -92,6 +94,12 @@ export default function Detail({ kind }: { kind: 'backtest' | 'sim' }) {
   const cal = useQuery({
     queryKey: ['cal', kind, nid],
     queryFn: () => (isBt ? getCalendar(nid) : getAccountCalendar(nid)),
+    enabled: !!id,
+  })
+  // 收益贡献归因（每只 ETF 给这个策略/账户贡献了多少钱、占比多少）
+  const contrib = useQuery({
+    queryKey: ['contrib', kind, nid],
+    queryFn: () => (isBt ? getContrib(nid) : getAccountContrib(nid)),
     enabled: !!id,
   })
 
@@ -287,6 +295,9 @@ export default function Detail({ kind }: { kind: 'backtest' | 'sim' }) {
                 <Card title="历史持仓权重堆积图" size="small">
                   {/* 堆积图只看已实现的调仓（未来那次是计划，不算历史权重） */}
                   <HoldingStack holdings={realized} height={380} />
+                </Card>
+                <Card title="ETF 标的贡献比（收益归因）" size="small">
+                  <ContribBar contrib={contrib.data} />
                 </Card>
               </div>
             ),

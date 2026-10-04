@@ -1,6 +1,6 @@
 import { api } from './client'
 import type {
-  CalendarPoint, CurvePoint, DrawdownPoint, Holding, ReturnPoint, SimAccount, SimSegment, Trade,
+  CalendarPoint, Contrib, CurvePoint, DrawdownPoint, Holding, ReturnPoint, SimAccount, SimSegment, Trade,
 } from '../types'
 
 export interface AccountInput {
@@ -92,4 +92,9 @@ export async function getAccountHoldings(id: number): Promise<Holding[]> {
 
 export async function getAccountCalendar(id: number): Promise<CalendarPoint[]> {
   return (await api.get<CalendarPoint[]>(`/sim/accounts/${id}/calendar`)).data
+}
+
+// 收益贡献归因（真实价口径，含分红）
+export async function getAccountContrib(id: number): Promise<Contrib> {
+  return (await api.get<Contrib>(`/sim/accounts/${id}/contrib`)).data
 }

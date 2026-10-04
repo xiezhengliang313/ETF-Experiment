@@ -218,6 +218,105 @@ export interface OosPoint {
   fold: number
 }
 
+// 收益贡献归因（/backtest/strategies/{sid}/contrib 与 /sim/accounts/{aid}/contrib）
+// 贡献（元）= 卖出金额 − 买入金额 − 手续费 + 期末股数×末价（模拟侧再加持有期分红）
+//           = 已实现盈亏（平均成本法）+ 浮动盈亏；各标的贡献之和恒等于净值增益
+export interface ContribRow {
+  code: string
+  name: string | null
+  trades: number
+  first_date: string | null
+  last_date: string | null
+  qty_end: number
+  avg_cost: number | null
+  last_close: number | null
+  bought: number
+  sold: number
+  fee: number
+  dividend: number
+  realized: number
+  unrealized: number
+  contrib: number
+  share_pct: number | null
+}
+
+export interface Contrib {
+  kind: 'backtest' | 'sim'
+  id: number
+  name: string | null
+  start_date: string | null
+  end_date: string | null
+  init_cash: number
+  rows: ContribRow[]
+  total_pnl: number
+  total_fee: number
+  nav_gain: number | null
+}
+
+// ETF 实时行情快照（/quote；framework/etf_quote.py 抓腾讯 qt.gtimg.cn 写入 etf_quote）
+// 「下标 -> 含义 -> 列名」的对照表在 framework/etf_quote.py 的文档字符串里：
+// ★ = 已用 etf_bars_raw 日线交叉核对过；未确认含义的字段没有进表（也不留 raw）。
+// 主键 (code, trade_date, quote_time)：盘中多次抓取会各留一行，列表页每个标的只显示最新那条。
+export interface Quote {
+  code: string
+  name: string | null
+  trade_date: string                 // 行情所属交易日（取自接口行情时间，非抓取当天）
+  quote_time: string | null          // 行情时间
+  // 核心行情
+  last: number | null
+  prev_close: number | null
+  open: number | null
+  high: number | null
+  low: number | null
+  change: number | null
+  change_pct: number | null
+  amplitude_pct: number | null
+  volume: number | null              // 手（1 手 = 100 份）
+  amount_wan: number | null          // 万元
+  turnover_pct: number | null
+  avg_price: number | null
+  volume_ratio: number | null
+  // 盘口五档
+  bid1_px: number | null; bid1_qty: number | null
+  bid2_px: number | null; bid2_qty: number | null
+  bid3_px: number | null; bid3_qty: number | null
+  bid4_px: number | null; bid4_qty: number | null
+  bid5_px: number | null; bid5_qty: number | null
+  ask1_px: number | null; ask1_qty: number | null
+  ask2_px: number | null; ask2_qty: number | null
+  ask3_px: number | null; ask3_qty: number | null
+  ask4_px: number | null; ask4_qty: number | null
+  ask5_px: number | null; ask5_qty: number | null
+  outer_vol: number | null
+  inner_vol: number | null
+  order_diff: number | null
+  // 净值与折溢价（ETF 专用）
+  nav: number | null
+  premium: number | null
+  // 区间涨跌幅 %
+  ret_ytd: number | null
+  ret_5d: number | null
+  ret_10d: number | null
+  ret_20d: number | null
+  ret_60d: number | null
+  high_52w: number | null
+  low_52w: number | null
+  // 市值 / 股本 / 涨跌停
+  market_cap: number | null          // 亿
+  float_cap: number | null           // 亿
+  total_shares: number | null        // 股
+  float_shares: number | null        // 股
+  limit_up: number | null
+  limit_down: number | null
+}
+
+export interface QuoteSnapshot {
+  trade_date: string | null
+  quote_time: string | null
+  count: number
+  rows: Quote[]
+}
+
 export interface Task {
   task_id: string
   name: string
