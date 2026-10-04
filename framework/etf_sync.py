@@ -27,7 +27,8 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-import akshare as ak
+# akshare 不在这里 import：包很大（几十 MB 依赖），而且只有同步交易日历要用。
+# 改成 fetch_calendar() 内部延迟导入 —— 不装 akshare 也能正常起后端、看页面。
 import pandas as pd
 import psycopg
 import requests
@@ -124,6 +125,10 @@ class EtfSync:
         接口自带未来交易日（节假日安排已公布到 2026-12-31），
         所以这里不按 START / 今天 截断 —— 日历要能用来查未来的交易日。
         """
+        try:
+            import akshare as ak      # 延迟导入：只有这一步需要 akshare
+        except ImportError as e:
+            raise RuntimeError("同步交易日历需要 akshare：pip install akshare") from e
         raw = ak.tool_trade_date_hist_sina()
         df = pd.DataFrame({"cal_date": pd.to_datetime(raw.iloc[:, 0]).dt.date})
         return df.assign(is_open=True)
