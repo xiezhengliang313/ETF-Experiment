@@ -154,7 +154,7 @@ class BacktestFramework:
 
     # ---------------------------------------------------------------- 取数
     def load_prices(self, conn, codes, start, end, warmup=0):
-        """返回 (close 矩阵 DataFrame[grid 升序, codes], name 映射, grid 列表)。"""
+        """返回 (close 矩阵, open 矩阵, name 映射, grid 列表)，矩阵均按 [grid 升序, codes] 排列。"""
         with conn.cursor() as cur:
             pre = []
             if warmup:
@@ -171,28 +171,34 @@ class BacktestFramework:
             raise RuntimeError("区间内无交易日")
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT code, trade_date, close, name FROM etf_bars_hfq "
+                "SELECT code, trade_date, open, close, name FROM etf_bars_hfq "
                 "WHERE code = ANY(%s) AND trade_date BETWEEN %s AND %s",
                 (codes, grid[0], grid[-1]))
             rows = cur.fetchall()
-        df = pd.DataFrame(rows, columns=["code", "trade_date", "close", "name"])
+        df = pd.DataFrame(rows, columns=["code", "trade_date", "open", "close", "name"])
         name_map = df.groupby("code")["name"].first().to_dict()
-        piv = df.pivot_table(index="trade_date", columns="code", values="close")
-        piv = piv.reindex(pd.DatetimeIndex(grid)).sort_index()
-        cols = [c for c in codes if c in piv.columns]
-        return piv[cols].ffill(), name_map, grid
+        piv_c = df.pivot_table(index="trade_date", columns="code", values="close")
+        piv_c = piv_c.reindex(pd.DatetimeIndex(grid)).sort_index()
+        # 去重且保序：策略成分里若出现重复代码，下面按 cols 生成的调仓行就会重复，
+        # 落库时撞 bt_holdings 主键 (strategy_id, rebal_date, code)。
+        cols = list(dict.fromkeys(c for c in codes if c in piv_c.columns))
+        # 开盘价矩阵（成交用）。后复权表里 open 与 close 同一天、同一复权因子，直接对齐即可；
+        # 万一某行缺 open，引擎会在成交时退回当日 close。
+        piv_o = df.pivot_table(index="trade_date", columns="code", values="open")
+        piv_o = piv_o.reindex(pd.DatetimeIndex(grid)).sort_index()
+        return piv_c[cols].ffill(), piv_o[cols].ffill(), name_map, grid
 
     # ---------------------------------------------------------------- 后复权引擎
     def engine(self, strategy_method, params, codes, start, end, conn, data=None, state=False):
-        # data=(C, name_map, grid) 由调用方（寻优框架）预载一次传入；否则自己按需加载
-        # state=True 时额外返回末态（现金/持仓/收盘/该日信号权重），给「前瞻信号」用；
-        # 寻优框架每个候选都要跑一次引擎，不需要末态，所以默认 False 省掉一次权重计算。
+        # data=(C_close, C_open, name_map, grid) 由调用方（寻优框架）预载一次传入；否则自己按需加载。
+        # C_close 用于权重/估值；C_open 用于成交。state=True 时额外返回末态（现金/持仓/收盘/该日信号权重），
+        # 给「前瞻信号」用；寻优框架每个候选都要跑一次引擎，不需要末态，默认 False 省掉一次权重计算。
         period = params["period"]
         if data is None:
             max_win = max(int(params.get("lookback") or 0), int(params.get("long_window") or 0))
-            C, name_map, grid = self.load_prices(conn, codes, start, end, max_win + period + 5)
+            C, O, name_map, grid = self.load_prices(conn, codes, start, end, max_win + period + 5)
         else:
-            C, name_map, grid = data
+            C, O, name_map, grid = data
         cols = list(C.columns)
         if not cols:
             raise RuntimeError("成分无 hfq 数据: " + ",".join(codes))
@@ -221,12 +227,15 @@ class BacktestFramework:
                         target[c] = 0
                     else:
                         target[c] = int(np.floor(w[c] * sig_equity / px / self.lot) * self.lot)
-                ec = C.iloc[p]
+                ec = C.iloc[p]                 # 当日收盘（估值 / 记录用）
+                # 成交价 = 当日开盘；开盘缺失/无效时退回收盘价兜底。
+                # 信号用 T-1(=sig) 收盘，成交用 T 开盘：贴近「当晚算好信号 → 次日开盘下单」的真实流程。
+                xec = O.iloc[p].where(O.iloc[p] > 0, ec)
                 # 先卖后买
                 for c in cols:
                     if target[c] < qty[c]:
                         sq = qty[c] - target[c]
-                        px = ec[c] * (1 - self.slip)
+                        px = xec[c] * (1 - self.slip)
                         if pd.isna(px) or px <= 0:
                             continue
                         amt = sq * px
@@ -236,11 +245,11 @@ class BacktestFramework:
                         trades.append((d, c, name_map.get(c), "SELL", sq, round(float(px), 4), amt, fee))
                 buys = [(c, target[c] - qty[c]) for c in cols if target[c] > qty[c]]
                 if buys:
-                    cost = sum(bq * float(ec[c]) * (1 + self.slip) * (1 + self.fee)
-                               for c, bq in buys if not pd.isna(ec[c]) and ec[c] > 0)
+                    cost = sum(bq * float(xec[c]) * (1 + self.slip) * (1 + self.fee)
+                               for c, bq in buys if not pd.isna(xec[c]) and xec[c] > 0)
                     scale = min(1.0, cash / cost) if cost > 0 else 1.0
                     for c, bq in buys:
-                        px = ec[c] * (1 + self.slip)
+                        px = xec[c] * (1 + self.slip)
                         if pd.isna(px) or px <= 0:
                             continue
                         bq2 = int(np.floor(bq * scale / self.lot) * self.lot)
@@ -429,7 +438,35 @@ class BacktestFramework:
                     for d, sd in rec["calendars"] if after(d)]
         hold_rows = [(strategy_id, strategy_name, d, c, nm, w, sc, se, tq)
                      for d, c, nm, w, sc, se, tq in rec["holdings"] if after(d)]
+        # 去重兜底：同一 (调仓日, 代码) 只保留最后一行。成分表里若混入重复代码，
+        # 引擎会对同一 (日, 代码) 生成两行，INSERT 时撞自己（与旧数据无关）。
+        hold_rows = list({(r[2], r[3]): r for r in hold_rows}.values())
+        # 本次要写的调仓日。这些日期上可能已有旧行：上次运行把「下一调仓日」当
+        # 前瞻信号写进了 bt_holdings（见 save_future_holdings），或当日重跑过。
+        # 下面先按这些日期删干净再插，否则会撞 bt_holdings 的主键。
+        hold_dates = sorted({r[2] for r in hold_rows})
+        nav_dates = sorted({r[2] for r in nav_rows})
+        trade_dates = sorted({r[2] for r in trade_rows})
         with conn.cursor() as cur:
+            if since is None:
+                # 全量重算：整段重写。结果表是「输入数据(行情)的快照」，行情（尤其后复权
+                # 因子）重同步后历史价会变，旧结果必须作废重算；否则像 −4.58% 那种假跳空
+                # 永远修不掉（旧逻辑只追加新日期、从覆盖已有日期）。
+                cur.execute("DELETE FROM bt_holdings WHERE strategy_id = %s", (strategy_id,))
+                cur.execute("DELETE FROM bt_nav WHERE strategy_id = %s", (strategy_id,))
+                cur.execute("DELETE FROM bt_trades WHERE strategy_id = %s", (strategy_id,))
+                cur.execute("DELETE FROM bt_calendar WHERE strategy_id = %s", (strategy_id,))
+            else:
+                # 增量：按本次要写的日期先删后插，保证覆盖式幂等。
+                if hold_dates:
+                    cur.execute("DELETE FROM bt_holdings WHERE strategy_id = %s AND rebal_date = ANY(%s)",
+                                (strategy_id, hold_dates))
+                if nav_dates:
+                    cur.execute("DELETE FROM bt_nav WHERE strategy_id = %s AND trade_date = ANY(%s)",
+                                (strategy_id, nav_dates))
+                if trade_dates:
+                    cur.execute("DELETE FROM bt_trades WHERE strategy_id = %s AND trade_date = ANY(%s)",
+                                (strategy_id, trade_dates))
             cur.executemany(
                 "INSERT INTO bt_nav (strategy_id, strategy_name, trade_date, nav, cash, market_value, total) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s)", nav_rows)
@@ -441,13 +478,15 @@ class BacktestFramework:
                 "VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", cal_rows)
             cur.executemany(
                 "INSERT INTO bt_holdings (strategy_id, strategy_name, rebal_date, code, name, weight, signal_close, signal_equity, target_qty) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", hold_rows)
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", hold_rows)
         conn.commit()
 
     def save_benchmark_nav(self, conn, strategy_id, bench_code, bench_rows, since=None):
         rows = [(strategy_id, bench_code, d, round(n, 6))
                 for d, n in bench_rows if since is None or d > since]
         with conn.cursor() as cur:
+            if since is None:
+                cur.execute("DELETE FROM bt_benchmark_nav WHERE strategy_id = %s", (strategy_id,))
             cur.executemany(
                 "INSERT INTO bt_benchmark_nav (strategy_id, benchmark, trade_date, nav) "
                 "VALUES (%s,%s,%s,%s)", rows)
@@ -496,7 +535,6 @@ class BacktestFramework:
                 params = ({"period": period, "long_window": long_window, "short_window": short_window}
                           if method == "trend" else
                           {"period": period, "lookback": lookback, "min_w": float(min_w or 0), "max_w": float(max_w or 1)})
-                last = self._last_nav_date(conn, sid)
                 rec = self.engine(method, params, list(codes), start, end, conn, state=True)
                 dates = [d for d, *_ in rec["nav"]]
                 m = self.compute_metrics([x[1] for x in rec["nav"]])
@@ -505,9 +543,8 @@ class BacktestFramework:
                     m["bm_" + k] = v
                 m["excess_total"] = (m.get("ret_total") - m.get("bm_ret_total")) if m.get("ret_total") is not None and m.get("bm_ret_total") is not None else None
                 m["excess_annual"] = (m.get("ret_annual") - m.get("bm_ret_annual")) if m.get("ret_annual") is not None and m.get("bm_ret_annual") is not None else None
-                self.save(conn, sid, sname, rec, None if last is None else last)
-                self.save_benchmark_nav(conn, sid, bench, self.benchmark_nav(conn, bench, dates),
-                                         None if last is None else last)
+                self.save(conn, sid, sname, rec, None)
+                self.save_benchmark_nav(conn, sid, bench, self.benchmark_nav(conn, bench, dates), None)
                 self.update_metrics(conn, sid, m)
                 fut = self.schedule_future_calendar(conn, sid, sname, period)
                 if fut is not None:
@@ -515,9 +552,8 @@ class BacktestFramework:
                     n = self.save_future_holdings(conn, sid, sname, fut[0], self.future_signal_rows(rec, fut))
                     if n:
                         print(f"[BT]   ↳ 前瞻信号：信号日 {fut[1]} → 调仓日 {fut[0]}，{n} 只")
-                tag = "FULL" if last is None else "INCR"
                 print(f"[BT] strategy_id={sid} method={method} nav_end={m['nav_end']:.4f} "
-                      f"ret_annual={m['ret_annual']:.4f} mdd={m['max_drawdown']:.4f} [{tag}]")
+                      f"ret_annual={m['ret_annual']:.4f} mdd={m['max_drawdown']:.4f}")
         finally:
             conn.close()
 

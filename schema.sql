@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS bt_calendar (
     strategy_name TEXT,
     rebal_date    DATE NOT NULL,
     signal_date   DATE NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (strategy_id, rebal_date)
 );
 CREATE TABLE IF NOT EXISTS bt_trades (
@@ -204,6 +205,7 @@ CREATE TABLE IF NOT EXISTS bt_trades (
     price         NUMERIC(14,4),
     amount        NUMERIC(18,2),
     fee           NUMERIC(14,2),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (strategy_id, trade_date, code, side)
 );
 CREATE TABLE IF NOT EXISTS bt_nav (
@@ -214,6 +216,7 @@ CREATE TABLE IF NOT EXISTS bt_nav (
     cash          NUMERIC(18,2),
     market_value  NUMERIC(18,2),
     total         NUMERIC(18,2),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (strategy_id, trade_date)
 );
 CREATE TABLE IF NOT EXISTS bt_holdings (
@@ -226,6 +229,7 @@ CREATE TABLE IF NOT EXISTS bt_holdings (
     signal_close  NUMERIC(14,4),
     signal_equity NUMERIC(18,2),
     target_qty    BIGINT,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (strategy_id, rebal_date, code)
 );
 CREATE TABLE IF NOT EXISTS bt_benchmark_nav (
@@ -233,6 +237,7 @@ CREATE TABLE IF NOT EXISTS bt_benchmark_nav (
     benchmark   TEXT NOT NULL,
     trade_date  DATE NOT NULL,
     nav         NUMERIC(16,6),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (strategy_id, trade_date)
 );
 
@@ -350,6 +355,16 @@ CREATE TABLE IF NOT EXISTS etf_dividends (
     div_per_share NUMERIC(14,6) NOT NULL,
     source        TEXT NOT NULL DEFAULT 'imputed',
     note          TEXT,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (code, ex_date)
+);
+CREATE TABLE IF NOT EXISTS etf_splits (
+    code     TEXT NOT NULL,
+    ex_date  DATE NOT NULL,
+    ratio    NUMERIC(12,6) NOT NULL,   -- 股数乘数：1拆N=N（如5），N合1=1/N（如0.2）
+    source   TEXT NOT NULL DEFAULT 'imputed',
+    note     TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (code, ex_date)
 );
 
@@ -667,11 +682,17 @@ COMMENT ON COLUMN opt_oos_nav.trade_date IS '交易日（整条曲线逐日唯�
 COMMENT ON COLUMN opt_oos_nav.nav IS '拼接净值（各折样本外段以起点 1.0 归一后接续，整条曲线起点 1.0）';
 COMMENT ON COLUMN opt_oos_nav.fold IS '该交易日来自第几折（页面画折分界竖线、悬停显示该折参数）';
 
--- ---------- 四、分红表 ----------
+-- ---------- 四、分红 / 折算表 ----------
 COMMENT ON TABLE etf_dividends IS 'ETF 每份现金分红（自动反推生成，可人工校正）';
 COMMENT ON COLUMN etf_dividends.ex_date IS '除息日';
 COMMENT ON COLUMN etf_dividends.div_per_share IS '每份派息（元）';
 COMMENT ON COLUMN etf_dividends.source IS 'imputed 自动反推 / manual 人工修正';
+COMMENT ON COLUMN etf_dividends.updated_at IS '更新时间';
+COMMENT ON TABLE etf_splits IS 'ETF 份额折算（拆分/合并，自动反推生成，可人工校正）';
+COMMENT ON COLUMN etf_splits.ex_date IS '折算日';
+COMMENT ON COLUMN etf_splits.ratio IS '股数乘数：1拆N=N（如5），N合1=1/N（如0.2）';
+COMMENT ON COLUMN etf_splits.source IS 'imputed 自动反推 / manual 人工修正';
+COMMENT ON COLUMN etf_splits.updated_at IS '更新时间';
 
 -- ---------- 五、模拟账户表 sim_account（= 资金池）----------
 COMMENT ON TABLE sim_account IS '模拟账户=一笔连续资金：账户级收益/风险指标（模拟框架回填），账户内含多个策略分段';

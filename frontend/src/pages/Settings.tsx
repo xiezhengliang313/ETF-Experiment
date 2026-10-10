@@ -1,16 +1,15 @@
 import { useState } from 'react'
 import {
-  Alert, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Tabs,
+  Alert, Button, Card, ConfigProvider, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Tabs,
 } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
 import dayjs, { type Dayjs } from 'dayjs'
 import type { TableColumnsType } from 'antd'
 import { OosCurve } from '../components/OosCurve'
 import { ParamsForm, type ParamsValues } from '../components/ParamsForm'
 import { TaskNotice } from '../components/TaskNotice'
 import { useTask } from '../hooks/useTask'
-import { generateDividends, getCodes, getQuote, runQuote, syncMarket } from '../api/market'
+import { generateDividends, getCodes, syncMarket } from '../api/market'
 import { createStrategy, deleteStrategy, listStrategies, patchStrategy } from '../api/backtest'
 import { getWalkFolds, getWalkOos, getWinners, runOptimize } from '../api/optimize'
 import {
@@ -32,9 +31,6 @@ export default function Settings() {
     loading: running && task?.key === key,
     disabled: running && task?.key !== key,
   })
-  const navigate = useNavigate()
-  // 实时行情：这里只给「抓一次 + 概览」，全部字段在「实时行情」页面看
-  const quote = useQuery({ queryKey: ['quote'], queryFn: () => getQuote() })
   const [segModal, setSegModal] = useState<{ accountId: number; accountName: string } | null>(null)
   // 管理分段：就地改结束日（提前结束）/ 启停
   const [segListModal, setSegListModal] = useState<{ accountId: number; accountName: string } | null>(null)
@@ -100,6 +96,20 @@ export default function Settings() {
 
   const flipStrategy = async (r: Strategy, checked: boolean) => {
     await patchStrategy(r.strategy_id, { is_active: checked })
+    refresh()
+  }
+
+  // 胜出参数表里的「有效」开关 / 删除 —— 作用在与该寻优批次对应的策略上；
+  // 没写成策略的行（strategy_id 为空）不可操作。
+  const flipWinner = async (r: OptWinner, checked: boolean) => {
+    if (r.strategy_id == null) return
+    await patchStrategy(r.strategy_id, { is_active: checked })
+    refresh()
+  }
+
+  const delWinner = async (r: OptWinner) => {
+    if (r.strategy_id == null) return
+    await deleteStrategy(r.strategy_id)
     refresh()
   }
 
@@ -231,13 +241,6 @@ export default function Settings() {
     // 策略名由后端按 bt_params.opt_id 反查（胜出参数会写成那条策略）；没写成策略时显示 —
     { title: '策略名称', dataIndex: 'strategy_name', key: 'name', width: 170, render: (v) => v ?? '—' },
     {
-      // 晋级参数里最弱参数进过前 10% 候选的折数（如 19/20）；单段批次没有折；滚动批次还在跑时占位行 folds=0 → 显示「运行中」
-      title: '折数', key: 'folds', width: 76,
-      render: (_, r) => (r.basis === 'full' ? '—'
-        : r.folds ? `${r.winner_folds}/${r.folds}`
-          : <span style={{ color: '#faad14' }}>运行中</span>),
-    },
-    {
       title: '参数', dataIndex: 'params', key: 'p',
       render: (v, r) => paramText({ ...v, strategy_method: r.strategy_method }),
     },
@@ -246,6 +249,29 @@ export default function Settings() {
     { title: '夏普', dataIndex: 'sharpe', key: 'sh', width: 80, render: num2 },
     { title: '卡玛', dataIndex: 'calmar', key: 'ca', width: 80, render: num2 },
     { title: '索提诺', dataIndex: 'sortino', key: 'so', width: 86, render: num2 },
+    {
+      title: '有效',
+      dataIndex: 'is_active',
+      key: 'active',
+      width: 80,
+      render: (v: boolean | null | undefined, r) => (
+        <span onClick={(e) => e.stopPropagation()}>
+          <Switch checked={!!v} disabled={r.strategy_id == null} onChange={(c) => flipWinner(r, c)} />
+        </span>
+      ),
+    },
+    {
+      title: '操作',
+      key: 'op',
+      width: 90,
+      render: (_, r) => (
+        <span onClick={(e) => e.stopPropagation()}>
+          <Popconfirm title="删除该策略？" disabled={r.strategy_id == null} onConfirm={() => delWinner(r)}>
+            <Button danger size="small" disabled={r.strategy_id == null}>删除</Button>
+          </Popconfirm>
+        </span>
+      ),
+    },
   ]
 
   const onAccount = async (raw: any) => {
@@ -279,33 +305,9 @@ export default function Settings() {
               <Space direction="vertical">
                 <Space>
                   <Button type="primary" {...busy('sync')} onClick={() => startTask('sync', syncMarket)}>同步行情</Button>
-                  <Button {...busy('div')} onClick={() => startTask('div', generateDividends)}>生成分红</Button>
+                  <Button {...busy('div')} onClick={() => startTask('div', generateDividends)}>生成分红/折算</Button>
                 </Space>
-                <div style={{ color: '#999' }}>建议顺序：先同步行情，再生成分红，然后 回测刷新 / 寻优刷新 / 模拟刷新。</div>
-              </Space>
-            ),
-          },
-          {
-            key: 'quote',
-            label: '实时行情',
-            children: (
-              <Space direction="vertical" size="middle">
-                <Space>
-                  <Button type="primary" {...busy('quote')} onClick={() => startTask('quote', runQuote)}>
-                    抓取实时行情
-                  </Button>
-                  <span style={{ color: '#999' }}>
-                    腾讯 qt.gtimg.cn（GBK），标的取 etf_bars_raw 全部；主键含行情时间，盘中重复抓会各留一行
-                  </span>
-                </Space>
-                <div style={{ color: '#595959' }}>
-                  {quote.data?.trade_date
-                    ? `库里最新快照：交易日 ${quote.data.trade_date} · ${quote.data.count} 只 · 最新行情时间 ${String(quote.data.quote_time ?? '—').replace('T', ' ').slice(0, 19)}`
-                    : '库里还没有行情快照，点上面按钮抓一次'}
-                </div>
-                <Button type="link" style={{ padding: 0 }} onClick={() => navigate('/quote')}>
-                  去「实时行情」页面看全部字段（含五档盘口）→
-                </Button>
+                <div style={{ color: '#999' }}>建议顺序：先同步行情，再生成分红/折算，然后 回测刷新 / 寻优刷新 / 模拟刷新。</div>
               </Space>
             ),
           },
@@ -345,19 +347,21 @@ export default function Settings() {
                 <Card title="胜出参数" size="small">
                   <div style={{ color: '#999', marginBottom: 8 }}>
                     滚动窗口 + 样本外验证：每折在训练窗里跑完参数网格选参数，再用它在紧接的样本外窗跑一遍，各折样本外段拼成一条净值 ——
-                    表里的指标就是这条样本外拼接净值算出来的。「折数」= 晋级参数里最弱参数进过前 10% 候选的折数（如 19/20）。
+                    表里的指标就是这条样本外拼接净值算出来的。
                     <b>点任意一行</b>打开该批次的折明细弹窗（里面是该批次的样本外拼接净值曲线；单段批次没有折，不响应点击）。
                   </div>
-                  <Table
-                    rowKey="opt_id"
-                    columns={winnerCols}
-                    dataSource={winners.data ?? []}
-                    size="small"
-                    // 点行开折明细弹窗；单段批次没有折（folds 为空）→ 该行不可点
-                    onRow={(r) => (r.folds
-                      ? { onClick: () => setFoldModal(r), style: { cursor: 'pointer' } }
-                      : {})}
-                  />
+                  <ConfigProvider theme={{ components: { Table: { fontSize: 12 } } }}>
+                    <Table
+                      rowKey="opt_id"
+                      columns={winnerCols}
+                      dataSource={(winners.data ?? []).filter((w) => w.strategy_name != null)}
+                      size="small"
+                      // 点行开折明细弹窗；单段批次没有折（folds 为空）→ 该行不可点
+                      onRow={(r) => (r.folds
+                        ? { onClick: () => setFoldModal(r), style: { cursor: 'pointer' } }
+                        : {})}
+                    />
+                  </ConfigProvider>
                 </Card>
               </div>
             ),

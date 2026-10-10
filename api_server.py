@@ -38,7 +38,7 @@ from fastapi.responses import FileResponse
 
 from framework.etf_sync import EtfSync
 from framework.etf_quote import EtfQuote
-from framework.gen_dividends import DividendBuilder
+from framework.gen_corp_actions import CorpActionBuilder
 from framework.backtest_framework import BacktestFramework, sync_strategy_name
 from framework.optimize_framework import OptimizeFramework
 from framework.simulate_framework import SimulateFramework, sync_segment_name
@@ -329,7 +329,7 @@ def dividends(code: str | None = None):
 
 @app.post("/api/dividends/generate", status_code=202)
 async def dividends_generate():
-    tid = await submit("分红生成", lambda: DividendBuilder().run())
+    tid = await submit("分红/折算生成", lambda: CorpActionBuilder().run())
     return {"task_id": tid}
 
 
@@ -731,12 +731,16 @@ def opt_winners():
         "(SELECT avg(r.score) FROM opt_results r JOIN opt_folds f ON f.is_opt_id = r.opt_id "
         "WHERE f.opt_id = w.opt_id AND r.params = w.winner_params) AS score, "
         + walk_cols + ", "
+        "(SELECT b.strategy_id FROM bt_params b WHERE b.opt_id = w.opt_id LIMIT 1) AS strategy_id, "
+        "(SELECT b.is_active FROM bt_params b WHERE b.opt_id = w.opt_id LIMIT 1) AS is_active, "
         "(SELECT b.strategy_name FROM bt_params b WHERE b.opt_id = w.opt_id LIMIT 1) AS strategy_name "
         "FROM opt_walk w "
         "UNION ALL "
         "SELECT o.opt_id, o.strategy_method, o.codes, o.start_date, o.end_date, o.params, "
         "NULL::int, NULL::int, NULL::int, NULL::int, NULL::int, 'full' AS basis, o.score, "
         + full_cols + ", "
+        "(SELECT b.strategy_id FROM bt_params b WHERE b.opt_id = o.opt_id LIMIT 1) AS strategy_id, "
+        "(SELECT b.is_active FROM bt_params b WHERE b.opt_id = o.opt_id LIMIT 1) AS is_active, "
         "(SELECT b.strategy_name FROM bt_params b WHERE b.opt_id = o.opt_id LIMIT 1) AS strategy_name "
         "FROM opt_results o WHERE o.selected "
         "AND NOT EXISTS (SELECT 1 FROM opt_folds f WHERE f.is_opt_id = o.opt_id) "

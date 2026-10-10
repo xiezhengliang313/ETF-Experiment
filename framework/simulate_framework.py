@@ -2,7 +2,8 @@
 """模拟框架（唯一 class：SimulateFramework）
 
 真实货币引擎：信号用后复权(hfq)复用回测框架的策略方法，成交/估值用不复权(raw)，
-除息日从 etf_dividends 把现金分红计入现金。不复用回测框架的 engine/save。
+除息日从 etf_dividends 把现金分红计入现金，份额折算日从 etf_splits 按比例调整
+持仓股数（金额不变）。不复用回测框架的 engine/save。
 
 账户化模型（v8）：
 - sim_account = 一笔连续资金（账户级收益/风险指标 + init_cash + benchmark）
@@ -48,12 +49,21 @@ class SimulateFramework:
         df = pd.DataFrame(rows, columns=["code", "trade_date", "close"])
         piv = df.pivot_table(index="trade_date", columns="code", values="close")
         piv = piv.reindex(pd.DatetimeIndex(grid)).sort_index()
-        cols = [c for c in codes if c in piv.columns]
+        # 去重且保序：成分里若出现重复代码，下面按列生成的调仓行就会重复，
+        # 落库时撞 sim_holdings 主键 (account_id, rebal_date, code)。
+        cols = list(dict.fromkeys(c for c in codes if c in piv.columns))
         return piv[cols].ffill()
 
     def load_dividends(self, conn, codes):
         with conn.cursor() as cur:
             cur.execute("SELECT code, ex_date, div_per_share FROM etf_dividends WHERE code = ANY(%s)",
+                        (codes,))
+            return {(r[0], r[1]): float(r[2]) for r in cur.fetchall()}
+
+    def load_splits(self, conn, codes):
+        """份额折算表 -> {(code, ex_date): ratio}，ratio=股数乘数（拆分=N，合并=1/N）。"""
+        with conn.cursor() as cur:
+            cur.execute("SELECT code, ex_date, ratio FROM etf_splits WHERE code = ANY(%s)",
                         (codes,))
             return {(r[0], r[1]): float(r[2]) for r in cur.fetchall()}
 
@@ -79,15 +89,17 @@ class SimulateFramework:
             p = s["params"]
             max_win = max(int(p.get("lookback") or 0), int(p.get("long_window") or 0))
             warmup = max(warmup, max_win + p["period"] + 5)
-        C_hfq, name_map, grid = self.bt.load_prices(conn, union, start, end, warmup)
+        C_hfq, _, name_map, grid = self.bt.load_prices(conn, union, start, end, warmup)
         C_raw = self.load_raw(conn, union, grid)
         divs = self.load_dividends(conn, union)
+        splits = self.load_splits(conn, union)
         all_cols = list(C_hfq.columns)
         if not all_cols:
             raise RuntimeError("成分无行情: " + ",".join(union))
         # 每个分段预备：本段成分列 + 权重函数
         for s in segments:
-            s["seg_cols"] = [c for c in s["codes"] if c in all_cols]
+            # 去重且保序：重复代码会让同一调仓日生成重复的持仓行，落库撞主键
+            s["seg_cols"] = list(dict.fromkeys(c for c in s["codes"] if c in all_cols))
             s["weight_fn"] = self.bt.make_signal(s["method"], s["params"])
 
         start_idx = next(i for i, d in enumerate(grid) if d >= start)
@@ -99,6 +111,11 @@ class SimulateFramework:
         for p in range(start_idx, len(grid)):
             d = grid[p]
             seg = self._active_segment(segments, d)
+            # 0) 份额折算日：先按比例调持仓股数（拆分 qty×N、合并 qty×1/N），金额不变
+            for c in all_cols:
+                sp = splits.get((c, d))
+                if sp and qty[c]:
+                    qty[c] = int(round(qty[c] * sp))
             # 1) 除息日现金分红入账（先分红后调仓；持仓=昨日收盘）
             dividend = 0.0
             for c in all_cols:
@@ -198,7 +215,7 @@ class SimulateFramework:
 
     # ---------------------------------------------------------------- 基准（真实货币买入持有）
     def benchmark_nav(self, conn, bench_code, dates, init_cash):
-        """首日满仓买基准 ETF（raw），持仓不动，除息日分红入现金。"""
+        """首日满仓买基准 ETF（raw），持仓不动，除息日分红入现金，折算日调股数。"""
         if not dates:
             return []
         cash0 = float(init_cash)
@@ -207,6 +224,7 @@ class SimulateFramework:
             return []
         raw = raw_df[bench_code]
         divs = self.load_dividends(conn, [bench_code])
+        splits = self.load_splits(conn, [bench_code])
         cash, qty = cash0, 0
         rows = []
         for i, d in enumerate(dates):
@@ -215,6 +233,9 @@ class SimulateFramework:
                 qty = int(np.floor(cash / (px * (1 + self.slip) * (1 + self.fee)) / self.lot) * self.lot)
                 amt = qty * px * (1 + self.slip)
                 cash -= amt + amt * self.fee
+            sp = splits.get((bench_code, d))
+            if sp and qty:
+                qty = int(round(qty * sp))
             dv = divs.get((bench_code, d))
             if dv and qty:
                 cash += qty * dv
@@ -234,7 +255,24 @@ class SimulateFramework:
                     for sid, sname, d, sd in rec["calendars"] if after(d)]
         hold_rows = [(account_id, account_name, sid, sname, d, c, nm, w, sc, rc, se, tq)
                      for sid, sname, d, c, nm, w, sc, rc, se, tq in rec["holdings"] if after(d)]
+        # 去重兜底：同一 (调仓日, 代码) 只保留最后一行。成分表里若混入重复代码，
+        # 引擎会对同一 (日, 代码) 生成两行，INSERT 时撞自己（与旧数据无关）。
+        hold_rows = list({(r[2], r[4], r[5]): r for r in hold_rows}.values())
+        # 本次要写的调仓日。这些日期上可能已有旧行：上次运行把「下一调仓日」当
+        # 前瞻信号写进了 sim_holdings（见 save_future_holdings），或当日重跑过。
+        # 下面先按这些日期删干净再插，否则会撞 sim_holdings 的主键。
+        hold_dates = sorted({r[4] for r in hold_rows})
         with conn.cursor() as cur:
+            if since is None:
+                # 全量重跑：账户级结果表整段重写（先删后插，行情/折算/分红改动能整体覆盖）
+                cur.execute("DELETE FROM sim_nav WHERE account_id = %s", (account_id,))
+                cur.execute("DELETE FROM sim_trades WHERE account_id = %s", (account_id,))
+                cur.execute("DELETE FROM sim_calendar WHERE account_id = %s", (account_id,))
+                cur.execute("DELETE FROM sim_holdings WHERE account_id = %s", (account_id,))
+            elif hold_dates:
+                # 增量：仅清本次要写的调仓日旧行（前瞻信号/当日重跑撞主键用）
+                cur.execute("DELETE FROM sim_holdings WHERE account_id = %s AND rebal_date = ANY(%s)",
+                            (account_id, hold_dates))
             cur.executemany(
                 "INSERT INTO sim_nav (account_id, account_name, trade_date, nav, cash, market_value, dividend, total) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", nav_rows)
@@ -246,13 +284,15 @@ class SimulateFramework:
                 "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", cal_rows)
             cur.executemany(
                 "INSERT INTO sim_holdings (account_id, account_name, strategy_id, strategy_name, rebal_date, code, name, weight, signal_close, raw_close, signal_equity, target_qty) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", hold_rows)
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", hold_rows)
         conn.commit()
 
     def save_benchmark_nav(self, conn, account_id, account_name, bench_code, bench_rows, since=None):
         rows = [(account_id, account_name, bench_code, d, round(n, 6))
                 for d, n in bench_rows if since is None or d > since]
         with conn.cursor() as cur:
+            if since is None:
+                cur.execute("DELETE FROM sim_benchmark_nav WHERE account_id = %s", (account_id,))
             cur.executemany(
                 "INSERT INTO sim_benchmark_nav (account_id, account_name, benchmark, trade_date, nav) "
                 "VALUES (%s,%s,%s,%s,%s)", rows)
@@ -389,7 +429,6 @@ class SimulateFramework:
                 if not segments:
                     print(f"[SIM] 账户 {account_id}（{account_name}）无有效策略分段，跳过")
                     continue
-                last = self._last_nav_date(conn, account_id)
                 rec = self.engine(segments, start, end, float(init_cash), conn, state=True)
                 dates = [d for d, *_ in rec["nav"]]
                 m = self.bt.compute_metrics([x[1] for x in rec["nav"]])
@@ -401,9 +440,8 @@ class SimulateFramework:
                     if m.get("ret_total") is not None and m.get("bm_ret_total") is not None else None
                 m["excess_annual"] = (m.get("ret_annual") - m.get("bm_ret_annual")) \
                     if m.get("ret_annual") is not None and m.get("bm_ret_annual") is not None else None
-                self.save(conn, account_id, account_name, rec, None if last is None else last)
-                self.save_benchmark_nav(conn, account_id, account_name, bench, bm_rows,
-                                        None if last is None else last)
+                self.save(conn, account_id, account_name, rec, None)
+                self.save_benchmark_nav(conn, account_id, account_name, bench, bm_rows, None)
                 self.update_metrics(conn, account_id, m)
                 for seg in segments:
                     fut = self.schedule_future_calendar(conn, account_id, account_name,
@@ -416,7 +454,7 @@ class SimulateFramework:
                         if n:
                             print(f"[SIM]   ↳ 前瞻信号：信号日 {fut[1]} → 调仓日 {fut[0]}"
                                   f"（{seg['name']}），{n} 只")
-                tag = "FULL" if last is None else "INCR"
+                tag = "FULL"
                 ra = m.get("ret_annual")
                 ra_s = f"{ra:.4f}" if ra is not None else "N/A"
                 print(f"[SIM] account_id={account_id} 账户={account_name} "

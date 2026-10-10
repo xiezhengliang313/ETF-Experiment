@@ -105,15 +105,28 @@ class EtfSync:
     def _get_node(self, param, code):
         """请求腾讯接口，返回 data[code] 节点。
 
-        请求太密时腾讯的 WAF 会返回一个网页（HTTP 501）而不是 JSON，
-        直接 .json() 会抛出看不懂的 JSONDecodeError，所以这里退避重试。
+        两类情况都退避重试：
+        1. 请求太密时腾讯的 WAF 返回一个网页（HTTP 501）而不是 JSON；
+        2. 连接失败 / 读超时（ConnectionError 包括 Read timed out）。
+        直接 .json() 会抛出看不懂的 JSONDecodeError，所以这里重试几次再抛。
         """
         text = ""
+        last_err = None
         for attempt in range(self.RETRY):
-            text = requests.get(self.URL, params={"param": param}, timeout=30).text
-            if text.lstrip().startswith("{"):
-                return json.loads(text)["data"][code]
+            try:
+                text = requests.get(self.URL, params={"param": param}, timeout=30).text
+                if text.lstrip().startswith("{"):
+                    return json.loads(text)["data"][code]
+            except requests.exceptions.RequestException as e:
+                # 连接错误 / 读超时：别让单次网络抖动直接打断整轮同步，退避后重试
+                last_err = e
+                text = ""
             time.sleep(2 * (attempt + 1))       # 2s、4s、6s
+        if last_err is not None:
+            raise RuntimeError(
+                f"{code} 连续 {self.RETRY} 次请求失败（连接错误或超时）："
+                f"{last_err}。等几分钟再跑，或把 SLEEP 调大。"
+            )
         raise RuntimeError(
             f"{code} 连续 {self.RETRY} 次没拿到数据 —— 腾讯接口可能把你限流了。"
             f"等几分钟再跑，或把 SLEEP 调大。返回内容开头：{text[:80]!r}"
@@ -228,17 +241,30 @@ class EtfSync:
         print(f"{self.TABLE_CALENDAR}：新增 {n} 天")
 
     def sync_kline(self, conn, table, adjust):
-        """表二 / 表三：行情。两张表都走增量，从各自表里最后一天的次日开始补"""
+        """表二 / 表三：行情。
+
+        不复权（etf_bars_raw）：增量即可 —— 原始价不会被重算，历史值永远不变。
+
+        后复权（etf_bars_hfq）：必须全量重拉 + 覆盖。腾讯的后复权因子在分红/份额折算后
+        会"往前重算"整段历史；若只做增量，只覆盖最近几根，会让旧数据（旧因子）与新数据
+        （新因子）在最后一次同步的边界处断开，产生一根假跳空（此前曾把 10-08→10-09 的
+        净值凭空砸掉约 5% —— 底层持仓当天实际只涨了约 +0.5%）。全量覆盖保证一只基金每一根
+        K 线都用同一套因子，边界自然平滑。
+        """
         for code in self.CODES:
+            full = adjust == "hfq"
             with conn.cursor() as cur:
                 cur.execute(f"SELECT max(trade_date) FROM {table} WHERE code = %s", (code,))
                 last = cur.fetchone()[0]
-            start = None
-            if last:
-                start = last + timedelta(days=1)
-                if start > self.end:
-                    print(f"{table} {code}：已是最新（{last}）")
-                    continue
+            if full:
+                start = self.start                      # 后复权：全量，从项目起点重拉到底
+            else:
+                start = None
+                if last:
+                    start = last + timedelta(days=1)
+                    if start > self.end:
+                        print(f"{table} {code}：已是最新（{last}）")
+                        continue
             df = self.fetch_kline(code, adjust=adjust, start=start)
             note = ""
             if df.empty and adjust == "hfq" and self.FILL_HFQ_WITH_RAW:
@@ -251,14 +277,15 @@ class EtfSync:
                 # 正常情况：今天还没收盘，所以还没有今天这根 K 线
                 print(f"{table} {code}：暂无新数据（跳过）")
             else:
-                print(f"{table} {code}：增量 {n} 行（{df.trade_date.min()} ~ {df.trade_date.max()}）{note}")
+                scope = "全量刷新" if full else "增量"
+                print(f"{table} {code}：{scope} {n} 行（{df.trade_date.min()} ~ {df.trade_date.max()}）{note}")
 
     # ------------------------------------------------ 主流程
     def run(self):
         with self.connect() as conn:
             self.sync_calendar(conn)
             self.sync_kline(conn, self.TABLE_RAW, "")       # 不复权：增量
-            self.sync_kline(conn, self.TABLE_HFQ, "hfq")    # 后复权：增量
+            self.sync_kline(conn, self.TABLE_HFQ, "hfq")    # 后复权：全量（复权因子会重算历史，增量会有假跳空）
 
 
 if __name__ == "__main__":

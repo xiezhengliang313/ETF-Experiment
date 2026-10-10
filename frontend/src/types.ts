@@ -168,7 +168,9 @@ export interface OptWinner {
   test_days: number | null
   step_days: number | null
   basis: 'oos' | 'full'
+  strategy_id?: number | null
   strategy_name?: string | null
+  is_active?: boolean | null
   // 指标只有 7 项（与 opt_* 表落库口径一致）：期末净值 + 年化/最大回撤/夏普/年化波动/卡玛/索提诺
   nav_end?: number
   ret_annual?: number
